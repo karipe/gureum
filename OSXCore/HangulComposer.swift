@@ -95,6 +95,10 @@ final class HangulComposer: NSObject, Composer {
     private var _commitString: String
     /// 합성 중인 문자열. 현재는 JDK 호환 모드에만 사용된다.
     private var _composedString: String
+    /// 현재 설정되어 있는 키보드 식별자.
+    private var _keyboardIdentifier: String
+    /// 현재 입력된 중성이 이중모음용 중성인지 여부.
+    private var _isConjoinable: Bool
 
     let inputContext: HGInputContext
     let configuration = Configuration.shared
@@ -102,8 +106,9 @@ final class HangulComposer: NSObject, Composer {
     init(type: HangulComposer.ComposerType) {
         _commitString = ""
         _composedString = ""
-        let keyboardIdentifier = type.rawValue
-        let inputContext = HGInputContext(keyboardIdentifier: keyboardIdentifier)!
+        _keyboardIdentifier = type.rawValue
+        _isConjoinable = false
+        let inputContext = HGInputContext(keyboardIdentifier: _keyboardIdentifier)!
         self.inputContext = inputContext
         self.inputContext.setOption(HANGUL_IC_OPTION_AUTO_REORDER, value: configuration.hangulAutoReorder)
         self.inputContext.setOption(HANGUL_IC_OPTION_NON_CHOSEONG_COMBI, value: configuration.hangulNonChoseongCombination)
@@ -191,11 +196,25 @@ final class HangulComposer: NSObject, Composer {
         assertionFailure()
     }
 
+    func isConjoinableDiphtongForHangulForceStrictMode(_ string: String) -> Bool {
+        // 세벌식 390 및 세벌식 최종에서 이중모음 결합 전용 모음인지를 판별한다
+        "9/".contains(string)
+    }
+
+    func isJungseongForHangulForceStrictMode(_ string: String) -> Bool {
+        // 세벌식 390 및 세벌식 최종에서의 모음인지를 판별한다
+        "456789ertdfgcvb/".contains(string)
+    }
+
     func input(text string: String?,
                key keyCode: KeyCode,
                modifiers flags: NSEvent.ModifierFlags,
                client _: IMKTextInput & IMKUnicodeTextInput) -> InputResult
     {
+        // 설정을 직접 읽어오는 것이 아닌, 최종적으로 판별된 키보드 식별자를 사용한다
+        // 그 이유는, 두벌식 등 hangulForceStrictCombinationRule이 적용되지 않는 키보드에서 관련 로직에 들어가는 것을 피하기 위함이다
+        let hangulForceStrictMode = _keyboardIdentifier == "3fs" || _keyboardIdentifier == "39s"
+
         // libhangul은 backspace를 키로 받지 않고 별도로 처리한다.
         if keyCode == .delete {
             // JDK 호환 모드의 경우, _composedString가 있을 경우 그 문자를 우선적으로 지운다
@@ -218,9 +237,42 @@ final class HangulComposer: NSObject, Composer {
         } else {
             string = KeyMapLower[keyCode.rawValue] ?? string
         }
+
+        if hangulForceStrictMode {
+            // 중성이 없으면 당연히 조합가능하지 않다
+            if !inputContext.hasJungseong {
+                _isConjoinable = false
+            }
+            // 이중모음이 아닌 중성이 있을 때 이중모음용 중성이 아닌 모음을 입력한 경우 이전 입력을 우선 커밋한다
+            if inputContext.hasJungseong, isJungseongForHangulForceStrictMode(string), !_isConjoinable && !isConjoinableDiphtongForHangulForceStrictMode(string) {
+                _commitString.append(_composedString)
+                _composedString = ""
+                let ucsString = inputContext.flushUCSString()
+                let recentCommitString = representableString(ucsString: ucsString)
+                _commitString.append(recentCommitString)
+                _isConjoinable = false
+            }
+            // 중성이 없을 때 입력하는 키가 이중모음용 중성인 경우, 이중모음 조합 가능 모드를 켠다
+            if !inputContext.hasJungseong, isConjoinableDiphtongForHangulForceStrictMode(string) {
+                _isConjoinable = true
+            }
+        }
+
         let handled = inputContext.process(string.unicodeScalars.first!.value)
         let ucsString = inputContext.commitUCSString
         let recentCommitString = representableString(ucsString: ucsString)
+
+        if hangulForceStrictMode {
+            // 새 글자가 커밋되는 상황에서는 조합 가능 여부를 초기화한다
+            // 단, 이전 글자를 커밋시킨 후 새로 입력된 키가 이중모음용 중성인 경우, 이중모음 조합 가능 모드를 켠다
+            if !recentCommitString.isEmpty {
+                if inputContext.hasJungseong, isConjoinableDiphtongForHangulForceStrictMode(string) {
+                    _isConjoinable = true
+                } else {
+                    _isConjoinable = false
+                }
+            }
+        }
 
         if configuration.hangulDeferredSymbolCommit {
             if handled {
@@ -273,8 +325,10 @@ extension HangulComposer {
     func setKeyboard(identifier: String) {
         if configuration.hangulForceStrictCombinationRule, identifier == "39" || identifier == "3f" {
             let strictCombinationIdentifier = "\(identifier)s"
+            _keyboardIdentifier = strictCombinationIdentifier
             inputContext.setKeyboardWithIdentifier(strictCombinationIdentifier)
         } else {
+            _keyboardIdentifier = identifier
             inputContext.setKeyboardWithIdentifier(identifier)
         }
     }
